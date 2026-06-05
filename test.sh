@@ -22,7 +22,7 @@ docker run --rm \
   --volume $PWD/results:$PWD/results \
   --volume $PWD/sample_data:$PWD/sample_data \
   --workdir $PWD/sample_data \
-  ghcr.io/benjamin-heasly/geffenlab-kilosort4:local \
+  ghcr.io/geffenlab/geffenlab-kilosort4:local \
   --input-dir $PWD/sample_data/AS20-minimal3/03112025/ecephys \
   --results-dir $PWD/results
 
