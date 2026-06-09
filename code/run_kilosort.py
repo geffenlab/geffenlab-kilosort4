@@ -4,6 +4,7 @@ from typing import Optional, Sequence
 import logging
 from pathlib import Path
 import json
+from shutil import copy2, copytree, rmtree
 
 import torch
 
@@ -87,12 +88,32 @@ def parse_meta(
     return meta_info
 
 
+def rewrite_params_py_dat_path(
+    params_py_path: Path,
+    ap_bin_path: Path,
+):
+    """Rewrite the dat_path in the given params.py to refer to the original ap_bin_path, not the scratch path."""
+    logging.info(f"Rewriting dat_path in params.py: {params_py_path}")
+    logging.info(f"Using dat_path: {ap_bin_path}")
+    with open(params_py_path, 'r', encoding="utf-8") as f:
+        lines = f.readlines()
+
+    for index, line in enumerate(lines):
+        if line.startswith("dat_path"):
+            lines[index] = f"dat_path = ['{ap_bin_path.absolute().as_posix()}']"
+            break
+
+    with open(params_py_path, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+
+
 def find_probes_and_sort(
     input_path: Path,
     probe_ids: list[str],
     ap_meta_pattern: str,
     kilosort_settings_pattern: str,
-    results_path: Path
+    results_path: Path,
+    scratch_path: Path
 ):
     # Sort out CPU vs GPU mode.
     if torch.cuda.is_available():
@@ -131,13 +152,13 @@ def find_probes_and_sort(
             metadata = parse_meta(ap_meta_path)
             binary_channel_count = metadata['nSavedChans']
             binary_sample_rate = metadata['imSampRate']
-            logging.info(f"Expecting binary recording with {binary_channel_count} saved channels at {binary_sample_rate}Hz.")
+            logging.info(f"Expecting recording with {binary_channel_count} saved channels at {binary_sample_rate}Hz.")
 
-            ab_bin_path = ap_meta_path.with_suffix(".bin")
-            if not ab_bin_path.exists():
-                logging.info(f"No binary recording found at {ab_bin_path}")
+            ap_bin_path = ap_meta_path.with_suffix(".bin")
+            if not ap_bin_path.exists():
+                logging.info(f"No binary recording found at {ap_bin_path}")
                 continue
-            logging.info(f"Found binary recording: {ab_bin_path}")
+            logging.info(f"Found binary recording: {ap_bin_path}")
 
             # Count up matched probes for summary or error at the end.
             recording_count += 1
@@ -166,13 +187,53 @@ def find_probes_and_sort(
                 json.dump(kilosort_settings, settings_out)
 
             logging.info(f"Begin sorting for {probe_id} recording {recording_relative_path}")
-            run_kilosort(
-                device=device,
-                settings=kilosort_settings,
-                filename=ab_bin_path,
-                probe=kilosort4_probe,
-                results_dir=recording_results_path
-            )
+
+            if scratch_path is not None:
+                # Copy input recording from the original data directory to a scratch directory.
+                recording_scratch_path = Path(scratch_path, recording_relative_path)
+                recording_scratch_path.mkdir(exist_ok=True, parents=True)
+
+                ap_bin_scratch_path = Path(recording_scratch_path, ap_bin_path.name)
+                logging.info(f"Copying {probe_id} recording to scratch dir: {ap_bin_scratch_path}")
+                copy2(ap_bin_path, ap_bin_scratch_path)
+
+                # Work in a scratch directory.
+                results_scratch_path = Path(recording_scratch_path, "results")
+                if results_scratch_path.exists():
+                    logging.warning(f"Removing existing results scratch dir: {results_scratch_path}")
+                    rmtree(results_scratch_path)
+                results_scratch_path.mkdir(exist_ok=True, parents=True)
+                logging.info(f"Starting Kilosort4 with results scratch dir: {results_scratch_path}")
+                run_kilosort(
+                    device=device,
+                    settings=kilosort_settings,
+                    filename=ap_bin_scratch_path,
+                    probe=kilosort4_probe,
+                    results_dir=results_scratch_path
+                )
+
+                # Copy results out of scrach, back to the original results directory.
+                logging.info(f"Copying {probe_id} results from scratch dir: {results_scratch_path}")
+                copytree(results_scratch_path, recording_results_path, dirs_exist_ok=True)
+
+                # Repair Phy params.py to use original binary path, not the scratch path.
+                params_py_path = Path(recording_results_path, "params.py")
+                rewrite_params_py_dat_path(params_py_path, ap_bin_path)
+
+                # Remove the temporary scratch subdir for this probe.
+                logging.info(f"Removing {probe_id} scratch dir: {recording_scratch_path}")
+                rmtree(recording_scratch_path)
+
+            else:
+                # Work directly in the original data directory.
+                run_kilosort(
+                    device=device,
+                    settings=kilosort_settings,
+                    filename=ap_bin_path,
+                    probe=kilosort4_probe,
+                    results_dir=recording_results_path
+                )
+
             logging.info(f"Completed sorting for {probe_id} recording {recording_relative_path}")
 
     logging.info(f"Completed sorting for {recording_count} probes.")
@@ -216,17 +277,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="Where to write output result files (can be distinct from INPUT_DIR). (default: %(default)s)",
         default="results"
     )
+    parser.add_argument(
+        "--scratch-dir",
+        type=str,
+        help="Optional (fast) scratch dir to copy inputs to, and outputs from (can be distinct from INPUT_DIR and RESULTS_DIR). (default: %(default)s)",
+        default=None
+    )
 
     cli_args = parser.parse_args(argv)
     input_path = Path(cli_args.input_dir)
     results_path = Path(cli_args.results_dir)
+    if cli_args.scratch_dir is not None:
+        scratch_path = Path(cli_args.scratch_dir)
+    else:
+        scratch_path is None
     try:
         find_probes_and_sort(
             input_path,
             cli_args.probe_ids,
             cli_args.ap_meta_pattern,
             cli_args.kilosort_settings_pattern,
-            results_path
+            results_path,
+            scratch_path
         )
     except:
         logging.error("Error running Kilosort 4.", exc_info=True)

@@ -3,5 +3,6 @@
 .DS_Store
 
 scratch.py
+scratch/
 results/
 sample_data/
